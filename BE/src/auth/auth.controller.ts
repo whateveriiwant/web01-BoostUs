@@ -1,6 +1,7 @@
 import { Controller, Get, Post, Query, Req, Res } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { ApiOperation, ApiResponse, ApiTags } from '@nestjs/swagger';
+import { randomBytes, timingSafeEqual } from 'crypto';
 import type { Request, Response } from 'express';
 import { RefreshTokenExpiredException } from 'src/auth/exception/auth.exception';
 import { Public } from '../auth/decorator/public.decorator';
@@ -8,6 +9,17 @@ import { MemberDto } from '../member/dto/member.dto';
 import { AuthService } from './auth.service';
 import { CurrentMember } from './decorator/current-member.decorator';
 import { GithubCallbackQueryDto } from './dto/github-callback-query.dto';
+import { toSafeRedirectPath } from './util/oauth-redirect.util';
+
+const OAUTH_STATE_COOKIE = 'oauthState';
+const OAUTH_REDIRECT_COOKIE = 'oauthRedirect';
+const OAUTH_COOKIE_PATH = '/api/auth';
+const OAUTH_COOKIE_MAX_AGE = 10 * 60 * 1000; // 로그인 시작 후 10분 안에 콜백이 와야 함
+
+function isSameState(expected: string | undefined, received: string | undefined): boolean {
+  if (!expected || !received || expected.length !== received.length) return false;
+  return timingSafeEqual(Buffer.from(expected), Buffer.from(received));
+}
 
 @ApiTags('인증')
 @Controller('auth')
@@ -26,17 +38,44 @@ export class AuthController {
       scope: 'read:org',
     });
 
-    // redirect 파라미터가 있으면 state로 전달
-    if (redirect) {
-      params.append('state', redirect);
-    }
+    // state는 CSRF 방지용 난수로만 쓰고, 돌아갈 경로는 검증한 뒤 쿠키에 따로 보관
+    const state = randomBytes(16).toString('hex');
+    params.append('state', state);
+
+    const frontendUrl = this.configService.getOrThrow<string>('FRONTEND_URL');
+    const cookieOptions = {
+      httpOnly: true,
+      secure: this.configService.getOrThrow('NODE_ENV') === 'production',
+      sameSite: 'lax' as const, // GitHub에서 돌아오는 최상위 GET 이동에는 쿠키가 실림
+      path: OAUTH_COOKIE_PATH,
+      maxAge: OAUTH_COOKIE_MAX_AGE,
+    };
+    res.cookie(OAUTH_STATE_COOKIE, state, cookieOptions);
+    res.cookie(OAUTH_REDIRECT_COOKIE, toSafeRedirectPath(redirect, frontendUrl), cookieOptions);
 
     return res.redirect(`https://github.com/login/oauth/authorize?${params.toString()}`);
   }
 
   @Public()
   @Get('github/callback')
-  async githubCallback(@Query() query: GithubCallbackQueryDto, @Res() res: Response) {
+  async githubCallback(
+    @Query() query: GithubCallbackQueryDto,
+    @Req() req: Request,
+    @Res() res: Response,
+  ) {
+    const frontendUrl = this.configService.getOrThrow<string>('FRONTEND_URL');
+    const cookies = req.cookies as Record<string, string | undefined> | undefined;
+    const expectedState = cookies?.[OAUTH_STATE_COOKIE];
+    const redirectPath = toSafeRedirectPath(cookies?.[OAUTH_REDIRECT_COOKIE], frontendUrl);
+
+    res.clearCookie(OAUTH_STATE_COOKIE, { path: OAUTH_COOKIE_PATH });
+    res.clearCookie(OAUTH_REDIRECT_COOKIE, { path: OAUTH_COOKIE_PATH });
+
+    // 이 브라우저에서 시작한 로그인이 아니면 code를 교환하지 않고 로그인 페이지로 돌려보냄
+    if (!isSameState(expectedState, query.state)) {
+      return res.redirect(`${frontendUrl}/login`);
+    }
+
     const { accessToken, refreshToken } = await this.authService.handleCallback(query.code);
 
     res.cookie('accessToken', accessToken, {
@@ -53,10 +92,7 @@ export class AuthController {
       maxAge: Number(this.configService.getOrThrow('JWT_REFRESH_EXPIRES_IN')) * 1000, // 초 -> 밀리초
     });
 
-    // state에 redirect 경로가 있으면 해당 경로로, 없으면 메인 페이지로
-    const frontendUrl = this.configService.getOrThrow<string>('FRONTEND_URL');
-    const redirectUrl: string = query.state ? `${frontendUrl}${query.state}` : frontendUrl;
-    return res.redirect(redirectUrl);
+    return res.redirect(`${frontendUrl}${redirectPath}`);
   }
 
   @Get('me')
